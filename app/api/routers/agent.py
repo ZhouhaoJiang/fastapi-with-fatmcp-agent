@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 import json
 import logging
+import re # Import regex
 
 from ...llm.openai import OpenAILLM
 from .mcp_tools import get_mcp_client
@@ -13,28 +14,35 @@ logger = logging.getLogger("agent")
 # 创建路由器
 router = APIRouter(prefix="/api/agent", tags=["Agent模式"])
 
+# --- Constants for Resource Reading --- 
+RESOURCE_READ_PREFIX = "READ_RESOURCE:"
+# Regex to find the instruction and capture the URI
+RESOURCE_READ_PATTERN = re.compile(rf"^{RESOURCE_READ_PREFIX}\s*(\S+)", re.MULTILINE)
+# ------------------------------------
+
 # Pydantic模型
 class AgentRequest(BaseModel):
     prompt: str
     system_message: Optional[str] = None
-    max_iterations: int = 3  # 限制工具调用循环次数，防止无限循环
+    max_iterations: int = 5 # Increase max iterations slightly for resource reads
 
 class AgentResponse(BaseModel):
     final_response: str
     tool_calls_executed: List[Dict[str, Any]] = [] # 记录实际执行的工具调用
+    resources_read: List[Dict[str, Any]] = [] # 记录读取的资源
     iterations: int
 
 @router.post("/process", response_model=AgentResponse)
 async def agent_process(request: AgentRequest):
-    """使用Agent模式处理用户请求，LLM自主选择并调用工具"""
+    """使用Agent模式处理用户请求，LLM自主选择、调用工具或读取资源"""
     
     llm = OpenAILLM() # 初始化LLM
     mcp_client = await get_mcp_client() # 获取MCP客户端
     
-    # 1. 获取可用工具列表并格式化
+    # 1. 获取可用工具和资源列表
     try:
+        # Tools
         available_tools_raw = await mcp_client.list_tools()
-        # 需要将原始工具列表转换为字典格式，以便传递给LLM
         available_tools_dict = []
         for tool in available_tools_raw:
             tool_dict = {
@@ -56,43 +64,98 @@ async def agent_process(request: AgentRequest):
                     }
                     tool_dict["parameters"].append(param_info)
             available_tools_dict.append(tool_dict)
-        
         formatted_tools_for_llm = llm.format_tools(available_tools_dict)
         logger.info(f"传递给LLM的工具: {formatted_tools_for_llm}")
+        
+        # Resources
+        available_resources_raw = await mcp_client.list_resources()
+        available_resources_info = [ # Create a simple list of resource URIs and types
+            {"uri": res.uri, "type": getattr(res, 'mimeType', 'unknown')}
+            for res in available_resources_raw
+        ]
+        logger.info(f"可用的资源: {available_resources_info}")
+        
     except Exception as e:
-        logger.error(f"获取或格式化工具时出错: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"获取工具失败: {str(e)}")
+        logger.error(f"获取或格式化工具/资源时出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"获取工具/资源失败: {str(e)}")
 
-    # 初始化消息历史
-    messages = []
-    if request.system_message:
-        messages.append({"role": "system", "content": request.system_message})
-    messages.append({"role": "user", "content": request.prompt})
+    # 2. 构建初始消息，包含资源信息和读取指令
+    initial_system_message = request.system_message or "You are a helpful assistant."
+    # Append resource info and instructions to the system message
+    resource_prompt_part = "\n\nAvailable Resources (you can request to read them using 'READ_RESOURCE: <uri>'):\n" + "\n".join([f"- {res['uri']} ({res['type']})" for res in available_resources_info])
+    instruction_prompt_part = f"\n\nIf you need information from a resource to answer the user, output *only* '{RESOURCE_READ_PREFIX} <uri>' on a line by itself. Otherwise, respond to the user or call a tool if necessary."
+    
+    enhanced_system_message = initial_system_message + resource_prompt_part + instruction_prompt_part
+
+    messages = [
+        {"role": "system", "content": enhanced_system_message},
+        {"role": "user", "content": request.prompt}
+    ]
     
     tool_calls_executed = []
+    resources_read = []
     iterations = 0
 
-    # 2. Agent循环：LLM思考 -> 工具调用 -> LLM处理结果
+    # 3. Agent循环
     while iterations < request.max_iterations:
         iterations += 1
         logger.info(f"Agent 迭代 {iterations} - 当前消息: {messages}")
         
         try:
-            # 3. 调用LLM（可能请求工具调用）
+            # 4. 调用LLM
             llm_response = await llm.client.chat.completions.create(
                 model=llm.model_name,
                 messages=messages,
                 tools=formatted_tools_for_llm,
-                tool_choice="auto" # 让LLM自主决定是否调用工具
+                tool_choice="auto"
             )
             
             response_message = llm_response.choices[0].message
-            messages.append(response_message) # 将LLM的回复添加到历史记录
+            response_content = response_message.content or "" # Ensure content is not None
+            messages.append(response_message) # 添加LLM回复 (可能是文本、工具调用或资源读取请求)
             
-            # 4. 检查是否有工具调用请求
-            if response_message.tool_calls:
+            # 5. 检查是否请求读取资源
+            resource_match = RESOURCE_READ_PATTERN.search(response_content)
+            if resource_match:
+                resource_uri = resource_match.group(1).strip()
+                logger.info(f"LLM请求读取资源: {resource_uri}")
+                try:
+                    # 6. 读取资源
+                    resource_content = await mcp_client.get_resource(resource_uri)
+                    logger.info(f"资源 {resource_uri} 内容: {resource_content}")
+                    resources_read.append({"uri": resource_uri, "content": resource_content})
+
+                    # --- 修复：将资源结果作为用户消息添加到历史 --- 
+                    resource_feedback_content = f"Content of resource '{resource_uri}':\n\n{str(resource_content)}"
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": resource_feedback_content,
+                        }
+                    )
+                    # -------------------------------------------------
+
+                    # 继续循环，让LLM处理资源内容
+                    continue
+
+                except Exception as res_err:
+                    logger.error(f"读取资源 {resource_uri} 时出错: {res_err}")
+                    # --- 修复：将错误信息作为用户消息添加 --- 
+                    error_feedback_content = f"Attempted to read resource '{resource_uri}' but failed: {str(res_err)}"
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": error_feedback_content,
+                        }
+                    )
+                    # -----------------------------------------
+                    # 继续循环，让LLM知道读取失败
+                    continue
+            
+            # 8. 检查是否有实际的工具调用请求
+            elif response_message.tool_calls:
                 logger.info(f"LLM请求调用工具: {response_message.tool_calls}")
-                # 5. 执行工具调用
+                # 9. 执行工具调用
                 for tool_call in response_message.tool_calls:
                     function_name = tool_call.function.name
                     try:
@@ -117,7 +180,7 @@ async def agent_process(request: AgentRequest):
                         logger.info(f"序列化后的结果: {serializable_result}")
                         # ---------------------------------------------
                         
-                        # 6. 将工具结果添加到消息历史，以便LLM处理
+                        # 10. 将工具结果添加到消息历史，以便LLM处理
                         messages.append(
                             {
                                 "tool_call_id": tool_call.id,
@@ -148,13 +211,17 @@ async def agent_process(request: AgentRequest):
                                 "content": json.dumps({"error": f"工具执行失败", "details": str(tool_err)}),
                             }
                         )
+                # 处理完工具调用后，继续循环让LLM处理结果
+                continue
+            
             else:
-                # 7. 如果没有工具调用，表示LLM已生成最终回复
-                logger.info("LLM未请求工具调用，生成最终回复")
-                final_response = response_message.content
+                # 11. 如果既没读资源也没调用工具，返回最终回复
+                logger.info("LLM未请求资源或工具，生成最终回复")
+                final_response = response_content
                 return AgentResponse(
                     final_response=final_response,
                     tool_calls_executed=tool_calls_executed,
+                    resources_read=resources_read,
                     iterations=iterations
                 )
 
@@ -162,10 +229,10 @@ async def agent_process(request: AgentRequest):
             logger.exception("Agent处理过程中调用LLM时出错")
             raise HTTPException(status_code=500, detail=f"LLM处理失败: {str(llm_err)}")
 
-    # 如果达到最大迭代次数仍未获得最终回复
+    # 12. 达到最大迭代次数
     logger.warning("达到最大迭代次数")
+    final_response = "Agent达到最大迭代次数，未能完全处理请求。"
     # 尝试获取最后一条assistant消息作为回复
-    final_response = "Agent达到最大迭代次数，未能完全处理请求。" 
     for msg in reversed(messages):
         if msg.role == "assistant" and msg.content:
             final_response = msg.content
@@ -174,5 +241,6 @@ async def agent_process(request: AgentRequest):
     return AgentResponse(
         final_response=final_response,
         tool_calls_executed=tool_calls_executed,
+        resources_read=resources_read,
         iterations=iterations
     ) 
